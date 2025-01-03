@@ -1,0 +1,54 @@
+# Individual configuration settings
+
+# Absolute path of the directory with all Virtual Host configuration files
+# for the Apache HTTP Server.
+#
+# Default: /etc/httpd/vhosts.d
+#apache_configbase='/etc/httpd/vhosts.d'
+
+# Absolute path of the directory with all Virtual Host home directories
+# referenced in Virtual Host configuration for the Apache HTTP Server.
+#
+# Default: /var/www/vhosts
+#apache_vhostbase='/var/www/vhosts'
+
+# Name of the directory for the DocumentRoot directive in the Virtual Host
+# configuration for the Apache HTTP Server, typically 'htdocs' or
+# 'public_html'.
+#
+# Default: htdocs
+#apache_docrootname='htdocs'
+
+# Domain used for the ServerAdmin directive in Virtual Host configuration,
+# if unset it is derived from the (sub)domain used in the actual Virtual
+# Host configuration.
+#
+# Default: (unset)
+#apache_maildomain='example.net'
+
+# One Virtual Host configuration file per (sub)domain or one Virtual Host
+# configuration file for both, subdomain and domain.
+#
+# Default: (unset)
+#apache_singleconfig='true'
+
+# Length for passwords requested via pwgen.
+#
+# Default: 16
+#pwgen_length=16
+
+# Do not use specified characters in password. This will disable the pwgen
+# phomeme-based generator and use the random password generator.
+#
+# Default: ^°"§$&(){}[]´`\¸~*<>|'
+#pwgen_remove='^°"§$&(){}[]´`\\¸~*<>|'"\'"
+
+# Absolute path of the additional Postfix aliases database input file to
+# redirect local e-mails, resulting primarily from cron jobs, to /dev/null.
+# This however requires that alias_maps and alias_database are configured
+# in /etc/postfix/main.cf accordingly, e.g.:
+# > alias_maps = hash:/etc/aliases, hash:/etc/aliases-webhosting
+# > alias_database = hash:/etc/aliases, hash:/etc/aliases-webhosting
+#
+# Default: /etc/aliases-webhosting
+#postfix_aliases='/etc/aliases-webhosting'

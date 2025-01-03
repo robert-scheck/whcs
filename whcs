@@ -1,0 +1,57 @@
+#!/bin/bash
+#
+# Copyright (C) 2006-2025  Robert Scheck <robert@fedoraproject.org>
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 2 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License along
+# with this program; if not, see <https://www.gnu.org/licenses/>.
+#
+
+set -euo pipefail
+
+fail() {
+  for msg in "$@"; do
+    echo "${msg}" >&2
+  done
+  exit 1
+}
+
+usage() {
+  fail "Web Hosting Control Scripts (WHCS) 0.8.0, (c) 2006-2025 by Robert Scheck" \
+       "This program is free software with ABSOLUTELY NO WARRANTY; you may redistribute" \
+       "it under the terms of the GNU General Public License, version 2 or later." \
+       "" \
+       "Usage: $(basename "$0") [ACTION] [OPTIONS]" \
+       "" \
+       "Available actions: create-apache-redirect, create-apache-vhost, create-mariadb" \
+       "Example usage: whcs create-apache-vhost --help"
+}
+
+if (( $# >= 1 )); then
+  case "$1" in
+    '-h'|'--help'|'-V'|'--version')
+      usage
+      ;;
+    *)
+      declare -r action="$1"
+      shift
+
+      if [[ -x "$(dirname "$(readlink -f "$0")")/scripts/${action}" ]]; then
+        "$(dirname "$(readlink -f "$0")")/scripts/${action}" "$@"
+      else
+        fail "Error: Action '${action}' does not exist!"
+      fi
+      ;;
+  esac
+else
+  usage
+fi

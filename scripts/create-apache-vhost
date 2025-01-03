@@ -1,0 +1,303 @@
+#!/bin/bash
+#
+# Copyright (C) 2006-2025  Robert Scheck <robert@fedoraproject.org>
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 2 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License along
+# with this program; if not, see <https://www.gnu.org/licenses/>.
+#
+
+set -euo pipefail
+
+fail() {
+  for msg in "$@"; do
+    echo "${msg}" >&2
+  done
+  exit 1
+}
+
+# Validate and handle command options
+if ! getopt="$(getopt -o 'd:s:p:l:u:P::hV' --long 'domain:,subdomain:,php:,shell:,username:,password::,help,version' -n 'Error' -- "$@")"; then
+  exit 1
+fi
+
+eval set -- "${getopt}"
+unset "${getopt}"
+
+while true; do
+  case "$1" in
+    '-d'|'--domain')                 declare -r idn="$2";      shift 2; continue ;;
+    '-s'|'--subdomain')              declare -r subidn="$2";   shift 2; continue ;;
+    '-u'|'--username')               declare -r username="$2"; shift 2; continue ;;
+    '-p'|'--php')                    declare -r php="$2";      shift 2; continue ;;
+    '-l'|'--shell')                  declare -r shell="$2";    shift 2; continue ;;
+    '-P'|'--password')               case "$2" in
+                                       '')  declare    password=''   ;;
+                                       *)   declare -r password="$2" ;;
+                                     esac;                     shift 2; continue ;;
+    '-h'|'--help'|'-V'|'--version')  fail "whcs create-apache-vhost 0.8.0, (c) 2006-2025 by Robert Scheck" \
+                                          "This program is free software with ABSOLUTELY NO WARRANTY; you may redistribute" \
+					  "it under the terms of the GNU General Public License, version 2 or later." \
+                                          "" \
+					  "Usage: $(basename "$0") [OPTIONS]" \
+                                          "  -d, --domain=<domainname>    Domain without leading 'www.', e.g. 'example.net'" \
+                                          "  -s, --subdomain=<subdomain>  Precise subdomain, e.g. 'sub.example.net'" \
+                                          "  -p, --php=<version>          PHP version, e.g. 8.4, use 'none' to disable PHP" \
+                                          "  -l, --shell=<loginshell>     Login shell, e.g. /bin/bash, default /sbin/nologin" \
+                                          "  -u, --username=<username>    Linux system user for Apache suEXEC and PHP-FPM" \
+                                          "  -P, --password[=<password>]  Password for system user, leave empty for prompt" \
+                                          "  -h, --help                   Display this help and exit" \
+                                          "  -V, --version                Output version information and exit" \
+                                          "" \
+					  "Create simple HTTP-only Apache virtual host(s) with webspace and a PHP-FPM pool."
+                                     ;;
+    '--')                            shift; break ;;
+    *)                               fail "Error: Option '$1' is unsupported!"
+  esac
+done
+
+for arg; do
+  fail "Error: Argument '${arg}' is unsupported!"
+done
+
+# Perform precautionary measures
+# shellcheck disable=SC1091
+case "$(. /etc/os-release 2> /dev/null && echo "${ID}")" in
+  'almalinux'*|'centos'*|'fedora'*|'ol'*|'rhel'*|'rocky'*)  ;;
+  *)  fail 'Error: Unsupported operating system or Linux distribution!'
+esac
+
+for binary in chmod chown chpasswd grep groupadd idn2 install pwgen restorecon sed systemctl useradd usermod; do
+  if ! bin_path="$(command -v "${binary}" > /dev/null)" && ! [[ -x "${bin_path}" ]]; then
+    fail "Error: Mandatory program '${binary}' does not exist or is not executable!"
+  fi
+done
+unset "${binary}" "${bin_path}"
+
+cd "$(dirname "$(readlink -f "$0")")/../" || fail "Error: Can not change to '$(dirname "$(readlink -f "$0")")' directory!"
+
+[[ -f 'templates/php-fpm-pool' ]] || fail "Error: Missing 'templates/php-fpm-pool' for PHP-FPM pool configuration!"
+[[ -f 'templates/apache-vhost-documentroot' ]] || fail "Error: Missing 'templates/apache-vhost-documentroot' for virtual host configuration!"
+
+# Set defaults and read configuration file
+apache_configbase='/etc/httpd/vhosts.d'
+apache_vhostbase='/var/www/vhosts'
+apache_docrootname='htdocs'
+pwgen_length=16
+pwgen_remove='^°"§$&(){}[]´`\\¸~*<>|'"\'"
+postfix_aliases='/etc/aliases-webhosting'
+shell_default='/sbin/nologin'
+
+# shellcheck disable=SC1091
+[[ -f whcs.conf ]] && . whcs.conf
+
+# Validate and convert (sub)domain
+if [[ -v idn ]] && [[ -v subidn ]]; then
+  fail 'Error: Options --domain and --subdomain are mutually exclusive, please just pass either or!'
+elif ! [[ -v idn ]] && ! [[ -v subidn ]]; then
+  fail 'Error: You must use either --domain=name or --subdomain=name to specify a (sub)domain for the new Apache virtual host!'
+fi
+
+if [[ -v idn ]]; then
+  # shellcheck disable=SC2155
+  if ! declare -r domain="$(idn2 -- "${idn,,}" 2>&1)"; then
+    fail "Error: ${domain}!"
+  elif ! [[ "${domain}" =~ ^[a-z0-9\.\-]+\.[a-z0-9\-]{2,}$ ]]; then
+    fail "Error: Domain '${domain}' is not a valid domain name!"
+  elif [[ "${domain}" =~ ^www\.[a-z0-9\.\-]+\.[a-z0-9\-]{2,}$ ]]; then
+    fail "Error: Domain must not start with 'www.' subdomain!"
+  elif [[ -e "${apache_configbase}/${domain}.conf" ]] || [[ -e "${apache_configbase}/www.${domain}.conf" ]]; then
+    fail "Error: Apache virtual host configuration for domain '${domain}' exists already!"
+  elif [[ -e "${apache_vhostbase}/${domain}" ]] || [[ -e "${apache_vhostbase}/www.${domain}" ]]; then
+    fail "Error: Home directory for domain '${domain}' exists already!"
+  fi
+elif [[ -v subidn ]]; then
+  # shellcheck disable=SC2155
+  if ! declare -r subdomain="$(idn2 -- "${subidn,,}" 2>&1)"; then
+    fail "Error: ${subdomain}!"
+  elif ! [[ "${subdomain}" =~ ^[a-z0-9\.\-]+\.[a-z0-9\-]{2,}$ ]]; then
+    fail "Error: Subdomain '${subdomain}' is not a valid domain name!"
+  elif [[ -e "${apache_configbase}/${subdomain}.conf" ]]; then
+    fail "Error: Apache virtual host configuration for subdomain '${subdomain}' exists already!"
+  elif [[ -e "${apache_vhostbase}/${subdomain}" ]]; then
+    fail "Error: Home directory for subdomain '${subdomain}' exists already!"
+  fi
+fi
+
+# Validate PHP version
+if [[ -v php ]]; then
+  if [[ "${php,,}" != 'none' ]] && ! [[ -x "/opt/remi/php${php/./}/root/usr/sbin/php-fpm" ]]; then
+    fail "Error: PHP-FPM ${php} is not installed!"
+  fi
+else
+  for version in /opt/remi/php*; do
+    if [[ -d "${version}" ]] && [[ -x "${version}/root/usr/sbin/php-fpm" ]]; then
+      latest="${version/*\/php}"
+    fi
+  done
+  unset "${version}"
+
+  if [[ -v latest ]] && [[ "${latest}" =~ ^([0-9])([0-9])$ ]]; then
+    declare -r php="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}"
+    unset "${latest}"
+  else
+    fail "Error: Unable to autodetect installed PHP-FPM versions!"
+  fi
+fi
+
+if [[ "${php,,}" != 'none' ]] && [[ -e "/etc/opt/remi/php${php/./}/php-fpm.d/${username}.conf" ]]; then
+  fail "Error: PHP-FPM ${php} pool configuration for username '${username}' exists already!"
+fi
+
+# Validate login shell
+if [[ -v shell ]]; then
+  if ! [[ "${shell}" = '/'* ]]; then
+    fail "Error: Shell '${shell}' is not an absolute path!"
+  elif ! [[ -x "${shell}" ]]; then
+    fail "Error: Shell '${shell}' does not exist or is not executable!"
+  elif ! grep -q '^'"${shell}"'$' /etc/shells 2> /dev/null; then
+    fail "Error: Shell '${shell}' is not listed in /etc/shells!"
+  fi
+else
+  declare -r shell="${shell_default-/sbin/nologin}"
+fi
+
+# Validate username
+if [[ -v username ]]; then
+  if [[ "${username}" =~ ^([\._\-]|[0-9]+$) ]] || ! [[ "${username}" =~ ^[a-z0-9\._\-]+$ ]]; then
+    fail "Error: Invalid username '${username}', only a-z, 0-9, dot, dash and underscore are valid!"
+  elif (( ${#username} > 32 )); then
+    fail "Error: Username '${username}' is too long, maximum is 32 characters!"
+  elif getent passwd "${username}" > /dev/null 2>&1; then
+    fail "Error: Username '${username}' exists already!"
+  elif getent group "${username}" > /dev/null 2>&1; then
+    fail "Error: Groupname '${username}' exists already!"
+  fi
+else
+  fail 'Error: No username given, please use --username=name!'
+fi
+
+# Validate or request password
+if [[ -v password ]]; then
+  if [[ -z "${password}" ]]; then
+    while (( ${#password} < 12 )); do
+      read -r -s -p 'Enter password (min. 12 characters): ' password1
+      echo
+      read -r -s -p 'Repeat password: ' password2
+      echo
+
+      if [[ "${password1}" != "${password2}" ]]; then
+        echo 'Error: Passwords did not match!' >&2
+      elif (( ${#password1} < 12 )); then
+        echo 'Error: Password must have at least 12 characters!' >&2
+      else
+        declare -r password="${password1}"
+      fi
+    done
+  elif (( ${#password} < 12 )); then
+    fail 'Error: Password must have at least 12 characters!'
+  fi
+else
+  # shellcheck disable=SC2155
+  declare -r password="$(pwgen -y -c -B -n -r "${pwgen_remove}" "${pwgen_length-16}" 1)"
+  declare -r reveal_password="${password}"
+fi
+
+# Create system group and user
+groupadd "${username}"
+usermod -aG "${username}" apache
+
+declare -r homedir="${apache_vhostbase}/${subdomain-${domain+"www.${domain}"}}"
+useradd -m -d "${homedir}" -g "${username}" -s "${shell}" "${username}"
+chpasswd <<< "${username}:${password}"
+
+# Create virtual host directories and files
+chown "root:${username}" "${homedir}/"
+chmod 0750 "${homedir}/"
+install -d -m 0770 -o "${username}" -g "${username}" "${homedir}/"{"${apache_docrootname}",tmp}"/"
+install -d -m 0750 -o root -g "${username}" "${homedir}/logs/"
+if [[ "${php,,}" != 'none' ]]; then
+  install -m 0640 -o "${username}" -g "${username}" /dev/null "${homedir}/logs/php-${php}-error.log"
+  install -m 0640 -o "${username}" -g "${username}" /dev/null "${homedir}/logs/php-${php}-slow.log"
+fi
+install -d -m 0700 -o "${username}" -g "${username}" "${homedir}/.ssh/"
+install -m 0600 -o "${username}" -g "${username}" /dev/null "${homedir}/.ssh/authorized_keys"
+restorecon -R "${homedir}/"
+
+# Generate PHP-FPM pool configuration file
+if [[ "${php,,}" != 'none' ]]; then
+  [[ -f "templates/php${php/./}-php-fpm-pool" ]] && template="templates/php${php/./}-php-fpm-pool" || template='templates/php-fpm-pool'
+  sed -e '/^;;/d' \
+      -e "s|<BAREDOMAIN>|${domain-${subdomain-}}|g" \
+      -e "s|<DOMAIN>|${subdomain-${domain+"www.${domain}"}}|g" \
+      -e "s|<HOMEDIR>|${homedir}|g" \
+      -e "s|<MAILDOMAIN>|${apache_maildomain-${subdomain-${domain-}}}|g" \
+      -e "s|<PHPVERSION>|${php}|g" \
+      -e "s|<USER>|${username}|g" \
+      "${template}" > "/etc/opt/remi/php${php/./}/php-fpm.d/${username}.conf"
+  unset "${template}"
+
+  systemctl --quiet is-active "php${php/./}-php-fpm.service" && systemctl reload "php${php/./}-php-fpm.service"
+fi
+
+# Generate Apache virtual host configuration file(s)
+sed -e '/^##/d' \
+    -e "s|<BAREDOMAIN>|${domain-${subdomain-}}|g" \
+    -e "s|<DOCROOT>|${apache_docrootname}|g" \
+    -e "s|<DOMAIN>|${subdomain-${domain+"www.${domain}"}}|g" \
+    -e "s|<HOMEDIR>|${homedir}|g" \
+    -e "s|<MAILDOMAIN>|${apache_maildomain-${subdomain-${domain-}}}|g" \
+    -e "s|<PHPVERSION>|${php}|g" \
+    -e "s|<USER>|${username}|g" \
+    templates/apache-vhost-documentroot > "${apache_configbase}/${subdomain-${domain+"www.${domain}"}}.conf"
+if [[ "${php,,}" == 'none' ]]; then
+  sed -e '/<PHP>/,/<\/PHP>/{$!d}' -i "${apache_configbase}/${subdomain-${domain+"www.${domain}"}}.conf"
+else
+  sed -e '/^<PHP>/d' -e '/^<\/PHP>/d' -i "${apache_configbase}/${subdomain-${domain+"www.${domain}"}}.conf"
+fi
+
+if [[ -v domain ]] && [[ -f "templates/apache-vhost-redirect" ]]; then
+  sed -e '/^##/d' \
+      -e "s|<BAREDOMAIN>|${subdomain-${domain-}}|g" \
+      -e "s|<DOMAIN>|${subdomain-${domain-}}|g" \
+      -e "s|<HOMEDIR>|${homedir}|g" \
+      -e "s|<MAILDOMAIN>|${apache_maildomain-${subdomain-${domain-}}}|g" \
+      -e "s|<TARGET>|http://${subdomain-${domain+"www.${domain}"}}/|g" \
+      templates/apache-vhost-redirect > "${apache_configbase}/${subdomain-${domain-}}.conf"
+fi
+
+systemctl --quiet is-active httpd.service && systemctl reload httpd.service
+
+# Optionally: Install default user crontab
+if [[ -f "templates/crontab" ]] && [[ -d /var/spool/cron/ ]]; then
+  install -m 0600 -o "${username}" -g "${username}" -Z templates/crontab "/var/spool/cron/${username}"
+fi
+
+# Optionally: Update Postfix aliases to /dev/null
+if [[ -v postfix_aliases ]] && [[ -n "${postfix_aliases}" ]]; then
+  rm -f "${postfix_aliases}"
+
+  if grep -E '^alias_(maps|database)' /etc/postfix/main.cf 2> /dev/null | grep -q ":${postfix_aliases}"; then
+    while IFS=: read -r name _dummy _dummy _dummy _dummy home _dummy; do
+      [[ "${home}" == "${apache_vhostbase}"* ]] && echo "${name}: /dev/null" >> "${postfix_aliases}"
+    done < /etc/passwd
+
+    newaliases
+  fi
+fi
+
+# Reveal username and password (if it was generated)
+if [[ -v reveal_password ]]; then
+  [[ "${shell}" =~ ^(/usr)?/s?bin/(false|nologin)$ ]] && protocol='FTP' || protocol='SFTP'
+  echo "${protocol} username: ${username}"
+  echo "${protocol} password: ${reveal_password}"
+fi

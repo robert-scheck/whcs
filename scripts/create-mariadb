@@ -1,0 +1,168 @@
+#!/bin/bash
+#
+# Copyright (C) 2006-2025  Robert Scheck <robert@fedoraproject.org>
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 2 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License along
+# with this program; if not, see <https://www.gnu.org/licenses/>.
+#
+
+set -euo pipefail
+
+fail() {
+  for msg in "$@"; do
+    echo "${msg}" >&2
+  done
+  exit 1
+}
+
+# Validate and handle command options
+if ! getopt="$(getopt -o 'u:P::d:hV' --long 'username:,password::,database:,help,version' -n 'Error' -- "$@")"; then
+  exit 1
+fi
+
+eval set -- "${getopt}"
+unset "${getopt}"
+
+while true; do
+  case "$1" in
+    '-u'|'--username')               declare -r username="$2"; shift 2; continue ;;
+    '-P'|'--password')               case "$2" in
+                                       '')  declare    password=''   ;;
+                                       *)   declare -r password="$2" ;;
+                                     esac;                     shift 2; continue ;;
+    '-d'|'--database')               declare -r database="$2"; shift 2; continue ;;
+    '-h'|'--help'|'-V'|'--version')  fail "whcs create-mariadb 0.8.0, (c) 2006-2025 by Robert Scheck" \
+                                          "This program is free software with ABSOLUTELY NO WARRANTY; you may redistribute" \
+                                          "it under the terms of the GNU General Public License, version 2 or later." \
+                                          "" \
+					  "Usage: $(basename "$0") [OPTIONS]" \
+                                          "  -u, --username=<username>    Username of the new MariaDB user to be created" \
+                                          "  -P, --password[=<password>]  Password for MariaDB user, leave empty for prompt" \
+                                          "  -d, --database=<database>    Name of the database, if different to --username" \
+                                          "  -h, --help                   Display this help and exit" \
+                                          "  -V, --version                Output version information and exit" \
+                                          "" \
+                                          "Create new MariaDB database and MariaDB user (or GRANT only for existing user)."
+                                     ;;
+    '--')                            shift; break ;;
+    *)                               fail "Error: Option '$1' is unsupported!"
+  esac
+done
+
+for arg; do
+  fail "Error: Argument '${arg}' is unsupported!"
+done
+
+# Perform precautionary measures
+# shellcheck disable=SC1091
+case "$(. /etc/os-release 2> /dev/null && echo "${ID}")" in
+  'almalinux'*|'centos'*|'fedora'*|'ol'*|'rhel'*|'rocky'*)  ;;
+  *)  fail 'Error: Unsupported operating system or Linux distribution!'
+esac
+
+for binary in mysql pwgen sed; do
+  if ! bin_path="$(command -v "${binary}" > /dev/null)" && ! [[ -x "${bin_path}" ]]; then
+    fail "Error: Mandatory program '${binary}' does not exist or is not executable!"
+  fi
+done
+unset "${binary}" "${bin_path}"
+
+# Set defaults and read configuration file
+pwgen_length=16
+pwgen_remove='^°"§$&(){}[]´`\\¸~*<>|'"\'"
+
+# shellcheck disable=SC1091
+[[ -f whcs.conf ]] && . whcs.conf
+
+# Validate database connection
+result="$(mysql -e '\q' 2>&1)" || fail "Error: Connection to MariaDB server failed: ${result}"
+unset "${result}"
+
+# Validate username
+if [[ -v username ]]; then
+  if [[ "${username}" =~ ^([\._\-]|[0-9]+$) ]] || ! [[ "${username}" =~ ^[a-z0-9\._\-]+$ ]]; then
+    fail "Error: Invalid username '${username}', only a-z, 0-9, dot, dash and underscore are valid!"
+  elif (( ${#username} > 80 )); then
+    fail "Error: Username '${username}' is too long, maximum is 80 characters!"
+  elif ! result="$(mysql -B -N -e "SELECT count(user) FROM user WHERE user = '${username}' AND host = 'localhost';" mysql 2>&1)"; then
+    fail "Error: ${result}"
+  elif (( result > 0 )); then
+    declare -r grant=1
+  fi
+  unset "${result}"
+else
+  fail 'Error: No username given, please use --username=name!'
+fi
+
+# Validate database
+if [[ -v database ]]; then
+  if [[ "${database}" =~ ^([\._\-]|[0-9]+$) ]] || ! [[ "${database}" =~ ^[a-z0-9\._\-]+$ ]]; then
+    fail "Error: Invalid database name '${database}', only a-z, 0-9, dot, dash and underscore are valid!"
+  elif (( ${#username} > 64 )); then
+    fail "Error: Database name '${database}' is too long, maximum is 64 characters!"
+  fi
+else
+  declare -r database="${username}"
+fi
+
+# shellcheck disable=SC2001
+if [[ "$(echo "${database}" 2>&1 | sed -e 's/_*[[:digit:]]*$//' 2>&1)" != "${username}" ]]; then
+  fail "Error: Database name '${database}' does not match the naming schema of username '${username}'!"
+elif ! result="$(mysql -B -N -e "SELECT count(SCHEMA_NAME) FROM information_schema.SCHEMATA WHERE SCHEMA_NAME='${database}';" mysql 2>&1)"; then
+  fail "Error: ${result}"
+elif (( result > 0 )); then
+  fail "Error: Database '${database}' exists already!"
+fi
+unset "${result}"
+
+# Validate or request password
+if [[ -v password ]]; then
+  if [[ -z "${password}" ]]; then
+    while (( ${#password} < 12 )); do
+      read -r -s -p 'Enter password (min. 12 characters): ' password1
+      echo
+      read -r -s -p 'Repeat password: ' password2
+      echo
+
+      if [[ "${password1}" != "${password2}" ]]; then
+        echo 'Error: Passwords did not match!' >&2
+      elif (( ${#password1} < 12 )); then
+        echo 'Error: Password must have at least 12 characters!' >&2
+      else
+        declare -r password="${password1}"
+      fi
+    done
+  elif (( ${#password} < 12 )); then
+    fail 'Error: Password must have at least 12 characters!'
+  fi
+else
+  # shellcheck disable=SC2155
+  declare -r password="$(pwgen -y -c -B -n -r "${pwgen_remove}" "${pwgen_length-16}" 1)"
+  declare -r reveal_password="${password}"
+fi
+
+# Create MariaDB user (if needed)
+[[ -v grant ]] || mysql -e "CREATE USER '${username}'@'localhost' IDENTIFIED BY '${password}';" mysql
+
+# Create MariaDB database
+mysql -e "CREATE DATABASE IF NOT EXISTS \`${database}\`;" mysql
+
+# Grant user permissions to its database
+mysql -e "GRANT ALL PRIVILEGES ON \`${database//_/\\_}\`.* TO '${username}'@'localhost';" mysql
+
+# Reveal username and password (if it was generated)
+if [[ -v reveal_password ]] && ! [[ -v grant ]]; then
+  echo "MariaDB database: ${database}"
+  echo "MariaDB username: ${username}"
+  echo "MariaDB password: ${reveal_password}"
+fi

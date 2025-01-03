@@ -1,0 +1,185 @@
+#!/bin/bash
+#
+# Copyright (C) 2006-2025  Robert Scheck <robert@fedoraproject.org>
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 2 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License along
+# with this program; if not, see <https://www.gnu.org/licenses/>.
+#
+
+set -euo pipefail
+
+fail() {
+  for msg in "$@"; do
+    echo "${msg}" >&2
+  done
+  exit 1
+}
+
+# Validate and handle command options
+if ! getopt="$(getopt -o 'd:s:t:u:hV' --long 'domain:,subdomain:,target:,username:,help,version' -n 'Error' -- "$@")"; then
+  exit 1
+fi
+
+eval set -- "${getopt}"
+unset "${getopt}"
+
+while true; do
+  case "$1" in
+    '-d'|'--domain')                 declare -r idn="$2";      shift 2; continue ;;
+    '-s'|'--subdomain')              declare -r subidn="$2";   shift 2; continue ;;
+    '-t'|'--target')                 declare -r target="$2";   shift 2; continue ;;
+    '-u'|'--username')               declare -r username="$2"; shift 2; continue ;;
+    '-h'|'--help'|'-V'|'--version')  fail "whcs create-apache-redirect 0.8.0, (c) 2006-2025 by Robert Scheck" \
+                                          "This program is free software with ABSOLUTELY NO WARRANTY; you may redistribute" \
+                                          "it under the terms of the GNU General Public License, version 2 or later." \
+                                          "" \
+                                          "Usage: $(basename "$0") [OPTIONS]" \
+                                          "  -d, --domain=<domainname>    Domain without leading 'www.', e.g. 'example.net'" \
+                                          "  -s, --subdomain=<subdomain>  Precise subdomain, e.g. 'sub.example.net'" \
+                                          "  -t, --target=<target-url>    Redirect target URL, e.g. 'https://example.org/'" \
+                                          "  -u, --username=<username>    Linux system user for optional Apache access_log" \
+                                          "  -h, --help                   Display this help and exit" \
+                                          "  -V, --version                Output version information and exit" \
+                                          "" \
+                                          "Create simple HTTP-only Apache virtual host(s) with HTTP redirects."
+                                     ;;
+    '--')                            shift; break ;;
+    *)                               fail "Error: Option '$1' is unsupported!"
+  esac
+done
+
+for arg; do
+  fail "Error: Argument '${arg}' is unsupported!"
+done
+
+# Perform precautionary measures
+# shellcheck disable=SC1091
+case "$(. /etc/os-release 2> /dev/null && echo "${ID}")" in
+  'almalinux'*|'centos'*|'fedora'*|'ol'*|'rhel'*|'rocky'*)  ;;
+  *)  fail 'Error: Unsupported operating system or Linux distribution!'
+esac
+
+for binary in idn2 sed systemctl; do
+  if ! bin_path="$(command -v "${binary}" > /dev/null)" && ! [[ -x "${bin_path}" ]]; then
+    fail "Error: Mandatory program '${binary}' does not exist or is not executable!"
+  fi
+done
+unset "${binary}" "${bin_path}"
+
+cd "$(dirname "$(readlink -f "$0")")/../" || fail "Error: Can not change to '$(dirname "$(readlink -f "$0")")' directory!"
+
+[[ -f 'templates/apache-vhost-redirect' ]] || fail "Error: Missing 'templates/apache-vhost-redirect' for virtual host configuration!"
+
+# Set defaults and read configuration file
+apache_configbase='/etc/httpd/vhosts.d'
+apache_vhostbase='/var/www/vhosts'
+
+# shellcheck disable=SC1091
+[[ -f whcs.conf ]] && . whcs.conf
+
+# Validate and convert (sub)domain
+if [[ -v idn ]] && [[ -v subidn ]]; then
+  fail 'Error: Options --domain and --subdomain are mutually exclusive, please just pass either or!'
+elif ! [[ -v idn ]] && ! [[ -v subidn ]]; then
+  fail 'Error: You must use either --domain=name or --subdomain=name to specify a (sub)domain for the new Apache virtual host!'
+fi
+
+if [[ -v idn ]]; then
+  # shellcheck disable=SC2155
+  if ! declare -r domain="$(idn2 -- "${idn,,}" 2>&1)"; then
+    fail "Error: ${domain}!"
+  elif ! [[ "${domain}" =~ ^[a-z0-9\.\-]+\.[a-z0-9\-]{2,}$ ]]; then
+    fail "Error: Domain '${domain}' is not a valid domain name!"
+  elif [[ "${domain}" =~ ^www\.[a-z0-9\.\-]+\.[a-z0-9\-]{2,}$ ]]; then
+    fail "Error: Domain must not start with 'www.' subdomain!"
+  elif [[ -e "${apache_configbase}/${domain}.conf" ]] || [[ -e "${apache_configbase}/www.${domain}.conf" ]]; then
+    fail "Error: Apache virtual host configuration for domain '${domain}' exists already!"
+  elif [[ -e "${apache_vhostbase}/${domain}" ]] || [[ -e "${apache_vhostbase}/www.${domain}" ]]; then
+    fail "Error: Home directory for domain '${domain}' exists already!"
+  fi
+elif [[ -v subidn ]]; then
+  # shellcheck disable=SC2155
+  if ! declare -r subdomain="$(idn2 -- "${subidn,,}" 2>&1)"; then
+    fail "Error: ${subdomain}!"
+  elif ! [[ "${subdomain}" =~ ^[a-z0-9\.\-]+\.[a-z0-9\-]{2,}$ ]]; then
+    fail "Error: Subdomain '${subdomain}' is not a valid domain name!"
+  elif [[ -e "${apache_configbase}/${subdomain}.conf" ]]; then
+    fail "Error: Apache virtual host configuration for subdomain '${subdomain}' exists already!"
+  elif [[ -e "${apache_vhostbase}/${subdomain}" ]]; then
+    fail "Error: Home directory for subdomain '${subdomain}' exists already!"
+  fi
+fi
+
+# Validate target
+if [[ -v target ]]; then
+  if [[ "${target}" =~ ^[a-z]+://[a-z0-9\.\-]+\.[a-z0-9\-]{2,}$ ]]; then
+    fail "Error: URL '${target}' must end with trailing slash character!"
+  elif ! [[ "${target}" =~ ^[a-z]+://[a-z0-9\.\-]+\.[a-z0-9\-]{2,}/ ]]; then
+    fail "Error: URL '${target}' is not a valid URL according to RFC 3986!"
+  fi
+else
+  fail 'Error: No target given, please use --target=url!'
+fi
+
+# Validate username
+if [[ -v username ]]; then
+  if [[ "${username}" =~ ^([\._\-]|[0-9]+$) ]] || ! [[ "${username}" =~ ^[a-z0-9\._\-]+$ ]]; then
+    fail "Error: Invalid username '${username}', only a-z, 0-9, dot, dash and underscore are valid!"
+  elif (( ${#username} > 32 )); then
+    fail "Error: Username '${username}' is too long, maximum is 32 characters!"
+  elif ! getent passwd "${username}" > /dev/null 2>&1; then
+    fail "Error: Username '${username}' does not exist!"
+  elif ! getent group "${username}" > /dev/null 2>&1; then
+    fail "Error: Groupname '${username}' does not exist!"
+  fi
+
+  while IFS=: read -r name _dummy _dummy _dummy _dummy home _dummy; do
+    if [[ "${name}" == "${username}" ]]; then
+      if [[ "${home}" == "${apache_vhostbase}"* ]]; then
+        declare -r homedir="${home}"
+        break
+      else
+        fail "Error: Home directory '${home}' of username '${username}' is not a subdirectory of '${apache_vhostbase}'!"
+      fi
+    fi
+  done < /etc/passwd
+fi
+
+# Generate Apache virtual host configuration file(s)
+sed -e '/^##/d' \
+    -e "s|<BAREDOMAIN>|${domain-${subdomain-}}|g" \
+    -e "s|<DOMAIN>|${subdomain-${domain+"www.${domain}"}}|g" \
+    -e "s|<MAILDOMAIN>|${apache_maildomain-${subdomain-${domain-}}}|g" \
+    -e "s|<TARGET>|${target}|g" \
+    templates/apache-vhost-redirect > "${apache_configbase}/${subdomain-${domain+"www.${domain}"}}.conf"
+if [[ -v homedir ]]; then
+  sed -e "s|<HOMEDIR>|${homedir}|g" -i "${apache_configbase}/${subdomain-${domain+"www.${domain}"}}.conf"
+else
+  sed -e '/^[[:space:]]*\(ErrorLog\|CustomLog\)[[:space:]+]<HOMEDIR>/d' -i "${apache_configbase}/${subdomain-${domain+"www.${domain}"}}.conf"
+fi
+
+if [[ -v domain ]] && ! [[ -v apache_singleconfig ]]; then
+  sed -e '/^##/d' \
+      -e "s|<BAREDOMAIN>|${subdomain-${domain-}}|g" \
+      -e "s|<DOMAIN>|${subdomain-${domain-}}|g" \
+      -e "s|<MAILDOMAIN>|${apache_maildomain-${subdomain-${domain-}}}|g" \
+      -e "s|<TARGET>|${target}|g" \
+      templates/apache-vhost-redirect > "${apache_configbase}/${subdomain-${domain-}}.conf"
+  if [[ -v homedir ]]; then
+    sed -e "s|<HOMEDIR>|${homedir}|g" -i "${apache_configbase}/${subdomain-${domain-}}.conf"
+  else
+    sed -e '/^[[:space:]]*\(ErrorLog\|CustomLog\)[[:space:]+]<HOMEDIR>/d' -i "${apache_configbase}/${subdomain-${domain-}}.conf"
+  fi
+fi
+
+systemctl --quiet is-active httpd.service && systemctl reload httpd.service

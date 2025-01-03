@@ -1,0 +1,6 @@
+whcs.conf
+templates/apache-vhost-documentroot
+templates/apache-vhost-redirect
+templates/crontab
+templates/php-fpm-pool
+templates/php??-php-fpm-pool
