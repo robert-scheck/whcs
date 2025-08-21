@@ -70,7 +70,7 @@ case "$(. /etc/os-release 2> /dev/null && echo "${ID}")" in
 esac
 
 for binary in idn2 sed systemctl; do
-  if ! bin_path="$(command -v "${binary}" > /dev/null)" && ! [[ -x "${bin_path}" ]]; then
+  if ! bin_path="$(command -v "${binary}")" && ! [[ -x "${bin_path}" ]]; then
     fail "Error: Mandatory program '${binary}' does not exist or is not executable!"
   fi
 done
